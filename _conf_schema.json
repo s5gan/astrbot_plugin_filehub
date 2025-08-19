@@ -1,0 +1,50 @@
+{
+  "root_dir": {
+    "description": "文件根目录",
+    "type": "string",
+    "default": "",
+    "hint": "用于存放实际文件与 registry.json 的目录；留空则使用 AstrBot/data/filehub"
+  },
+  "registry_file": {
+    "description": "索引文件 (JSON)",
+    "type": "string",
+    "default": "registry.json",
+    "hint": "可填写文件名或绝对路径；默认在 root_dir 下的 registry.json"
+  },
+  "callback_api_base": {
+    "description": "回调地址（必填）",
+    "type": "string",
+    "default": "",
+    "hint": "Napcat 从 Astrbot 拉取文件用的 HTTP 地址，如 http://127.0.0.1:6185 或可被 Napcat 访问的内网/域名。填写不当则无法发送文件"
+  },
+  "max_file_size_mb": {
+    "description": "文件大小阈值(MB)",
+    "type": "int",
+    "default": -1,
+    "hint": "-1 表示不限制；超过阈值时会提示并继续尝试发送"
+  },
+  "default_allow_users": {
+    "description": "默认允许用户ID",
+    "type": "list",
+    "default": [],
+    "hint": "当条目未设置权限且该列表非空时，仅允许列表中的用户；QQ号请写字符串，如 \"123456\""
+  },
+  "default_allow_groups": {
+    "description": "默认允许群ID",
+    "type": "list",
+    "default": [],
+    "hint": "当条目未设置权限且该列表非空时，仅允许列表中的群；群ID请写字符串"
+  },
+  "default_deny_users": {
+    "description": "默认拒绝用户ID",
+    "type": "list",
+    "default": [],
+    "hint": "全局拒绝的用户ID列表；QQ号请写字符串"
+  },
+  "default_deny_groups": {
+    "description": "默认拒绝群ID",
+    "type": "list",
+    "default": [],
+    "hint": "全局拒绝的群ID列表；群ID请写字符串"
+  }
+}
