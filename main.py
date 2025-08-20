@@ -306,7 +306,6 @@ class FileHubPlugin(Star):
             f"exists: {exists} size: {size_mb:.2f}MB",
             f"send_as: {e.get('send_as','auto')} is_image: {is_image(abs_path)}",
             f"description: {e.get('description','')}",
-            f"tags: {', '.join(map(str, e.get('tags') or []))}",
             f"you_can_access: {can}",
         ]
         perms = e.get("permissions") or {}
@@ -360,9 +359,8 @@ class FileHubPlugin(Star):
     async def tool_save_recent_file(
         self,
         event: AstrMessageEvent,
-        name: str,
+        name: str = "",
         description: str = "",
-        tags: List[str] | None = None,
         send_as: str = "auto",
     ) -> MessageEventResult:
         """保存最近一次用户发送的图片或文件到文件库并写入索引。
@@ -381,16 +379,29 @@ class FileHubPlugin(Star):
             return
         reg, _ = load_registry(self.root_dir, self.registry_file)
         files = reg.get("files", [])
-        base_slug = self._slugify(name or os.path.splitext(os.path.basename(abs_src))[0])
+        # 解析名称：若未提供，从用户文本中提取关键短语；再退回源文件名
+        raw_text = (event.message_str or "").strip()
+        nm = (name or "").strip()
+        if not nm and raw_text:
+            # 常见表达：就叫X / 名称: X / 叫X / 取名X
+            m = re.search(r"(?:就叫|名称\s*[:：]|叫|取名)\s*([^，。,\n\r\s]+)\s*$", raw_text)
+            if m:
+                nm = m.group(1)
+        if not nm:
+            nm = os.path.splitext(os.path.basename(abs_src))[0]
+        base_slug = self._slugify(nm)
+        # 解析发送方式：根据最近媒体类型兜底
+        s_as = (send_as or "auto").lower()
+        if s_as == "auto":
+            s_as = "image" if last.get("type") == "image" or is_image(abs_src) else "file"
         relp, final_name = self._copy_into_root(abs_src, base_slug)
         uid = self._unique_id(files, base_slug)
         entry = {
             "id": uid,
             "path": relp,
             "name": final_name,
-            "description": description or "",
-            "tags": list(tags or []),
-            "send_as": (send_as or "auto").lower(),
+            "description": (description or "").strip(),
+            "send_as": s_as,
             "permissions": {"allow": {"users": [], "groups": []}, "deny": {"users": [], "groups": []}},
         }
         files.append(entry)
@@ -405,7 +416,7 @@ class FileHubPlugin(Star):
         """搜索本地文件。
 
         Args:
-            query(string): 搜索关键词，可为文件名、标签或描述。
+            query(string): 搜索关键词，可为文件名或描述。
         """
         logger.info(f"[FileHub/tool] search_local_files query={query!r}")
         reg, _ = load_registry(self.root_dir, self.registry_file)
@@ -423,7 +434,6 @@ class FileHubPlugin(Star):
                 "id": e.get("id"),
                 "name": e.get("name") or os.path.basename(str(e.get("path", ""))),
                 "description": e.get("description") or "",
-                "tags": e.get("tags") or [],
                 "path": e.get("path", ""),
                 "send_as": (e.get("send_as") or "auto"),
                 "is_image": (
@@ -489,7 +499,7 @@ class FileHubPlugin(Star):
         """按关键词检索并直接发送最匹配的文件。
 
         Args:
-            query(string): 搜索关键词（文件名/标签/描述皆可）
+            query(string): 搜索关键词（文件名或描述皆可）
         """
         logger.info(f"[FileHub/tool] find_and_send query={query!r}")
         reg, _ = load_registry(self.root_dir, self.registry_file)
@@ -608,11 +618,10 @@ class FileHubPlugin(Star):
             return
         # 构造 System Prompt，强约束使用工具
         sys_prompt = (
-            "你是文件入库助手。用户说要保存最近的图片或文件时，必须调用 save_recent_file(name, description, tags, send_as)。\n"
+            "你是文件入库助手。用户说要保存最近的图片或文件时，必须调用 save_recent_file(name, description, send_as)。\n"
             "规范：\n"
             "- name：尽量从用户话里提取最简短易懂的名称（如只给了短语，则用该短语作为 name）；\n"
             "- description：保留用户额外描述；\n"
-            "- tags：从逗号/空格/顿号分隔的词里提取标签，如未提供可空；\n"
             "- send_as：若最近媒体是图片则用 'image'，若是普通文件则用 'file'，否则 'auto'；\n"
             "- 仅调用一次工具；成功后不要重复输出其他内容。\n"
         )
@@ -660,8 +669,7 @@ class FileHubPlugin(Star):
         """更新索引条目字段。
 
         用法：/filehub update <id> <field> <value>
-        - field 可为 name|desc|tags|send_as
-        - tags 用逗号分隔，如：标签1,标签2
+        - field 可为 name|desc|send_as
         """
         reg, _ = load_registry(self.root_dir, self.registry_file)
         files = reg.get("files", [])
@@ -674,8 +682,6 @@ class FileHubPlugin(Star):
             e["name"] = value.strip()
         elif field in {"desc", "description"}:
             e["description"] = value.strip()
-        elif field == "tags":
-            e["tags"] = [t.strip() for t in (value or "").split(",") if t.strip()]
         elif field == "send_as":
             v = (value or "auto").lower()
             if v not in {"auto", "image", "file"}:
@@ -683,7 +689,7 @@ class FileHubPlugin(Star):
                 return
             e["send_as"] = v
         else:
-            yield event.plain_result("不支持的字段，请使用 name|desc|tags|send_as")
+            yield event.plain_result("不支持的字段，请使用 name|desc|send_as")
             return
         try:
             self._save_registry({"files": files})
@@ -701,7 +707,7 @@ class FileHubPlugin(Star):
         用法：/filehub index [all|images] [yes|no]
         - mode = all | images（仅收集图片）
         - recursive = yes | no（是否递归子目录）
-        说明：仅新增未在索引中的文件，自动生成 id/name/send_as/tags。
+        说明：仅新增未在索引中的文件，自动生成 id/name/send_as。
         """
         reg, used_path = load_registry(self.root_dir, self.registry_file)
         files = reg.get("files", [])
@@ -737,7 +743,6 @@ class FileHubPlugin(Star):
                     "path": relp,
                     "name": fn,
                     "description": "",
-                    "tags": [os.path.splitext(fn)[1].lstrip(".")],
                     "send_as": "image" if is_image(fp) else "file",
                     "permissions": {"allow": {"users": [], "groups": []}, "deny": {"users": [], "groups": []}},
                 }

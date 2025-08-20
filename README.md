@@ -20,7 +20,6 @@ AstrBot FileHub 插件
       "path": "images/logo.png",
       "name": "项目Logo.png",
       "description": "团队项目Logo",
-      "tags": ["logo", "image"],
       "send_as": "auto",
       "permissions": {
         "allow": {"users": ["12345678"], "groups": ["987654321"]},
@@ -41,7 +40,7 @@ AstrBot FileHub 插件
 - `/filehub probe <id>` 诊断路径映射（用于排查 Napcat 无法读文件问题）
 - `/filehub set_callback <url>` 设置回调地址（Napcat 拉取文件用），如 `http://127.0.0.1:6185`
 - `/filehub remove <id>` 从索引移除条目（不删除物理文件）
-- `/filehub update <id> <field> <value>` 更新条目，field 支持 `name|desc|tags|send_as`
+- `/filehub update <id> <field> <value>` 更新条目，field 支持 `name|desc|send_as`
 
 自然语言驱动：
 - 无需指令，直接说“把XX文档发我”“找下关于XX的图片”等：
@@ -51,13 +50,13 @@ AstrBot FileHub 插件
 - “保存最近发送的媒体”（适配 QQ 手机版不能同时发文本和文件）：
   1) 先发送文件或图片；
   2) 再发送文本说明“把刚才那张图/文件保存一下，名称：XX，标签：A,B，描述：YYY”；
-  - 模型将调用 `save_recent_file(name, description?, tags?, send_as?)` 完成入库与索引写入。
+  - 模型将调用 `save_recent_file(name, description?, send_as?)` 完成入库与索引写入。
 
 LLM 工具（给有需要的开发者参考）：
-- `save_recent_file(name: string, description?: string, tags?: list[string], send_as?: string)`：
+- `save_recent_file(name: string, description?: string, send_as?: string)`：
   - 将“同一会话中最近一次用户发送的图片或文件”复制到 `root_dir/saved/` 并写入索引。
 - `search_local_files(query: string)`：返回 JSON 结果 
-  - 结构：`{ "results": [{ "id", "name", "description", "tags", "path", "send_as", "is_image" }] }`
+  - 结构：`{ "results": [{ "id", "name", "description", "path", "send_as", "is_image" }] }`
   - 说明：便于 LLM 直接解析 id、并基于 path/send_as/is_image 做更稳健的决策
 - `send_local_file_by_id(file_id: string)`：按索引 id 发送文件
 - `find_and_send(query: string)`：合并工具，检索并直接发送 top1（更易被 LLM 使用）

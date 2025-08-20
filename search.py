@@ -30,7 +30,6 @@ def search_entries(entries: List[Dict], query: str) -> List[Tuple[float, Dict]]:
         desc = str(e.get("description", "")).lower()
         path = str(e.get("path", ""))
         filename = os.path.basename(path).lower()
-        tags = [str(t).lower() for t in (e.get("tags") or [])]
 
         if q == id_ or q == filename or q == name:
             score += 10
@@ -40,8 +39,6 @@ def search_entries(entries: List[Dict], query: str) -> List[Tuple[float, Dict]]:
             score += 5
         if q in name:
             score += 4
-        if any(q in t for t in tags):
-            score += 3
         if q in desc:
             score += 2
         if score > 0:
@@ -54,5 +51,4 @@ def format_entry_brief(entry: Dict) -> str:
     """将条目格式化为简要的一行文本，便于在列表中展示"""
     name = entry.get("name") or os.path.basename(str(entry.get("path", "")))
     desc = entry.get("description") or ""
-    tags = entry.get("tags") or []
-    return f"{entry.get('id','')} | {name} | {desc} | tags: {', '.join(map(str,tags))}"
+    return f"{entry.get('id','')} | {name} | {desc}"
