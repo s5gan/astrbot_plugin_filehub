@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import time
+import shutil
 from typing import List, Dict, Any, Optional, Tuple
 from .registry import load_registry, resolve_registry_path
 from .permissions import norm_list_str, has_access
@@ -45,6 +47,9 @@ class FileHubPlugin(Star):
         self.default_deny_groups: List[str] = norm_list_str(self.config.get("default_deny_groups"))
         os.makedirs(self.root_dir, exist_ok=True)
 
+        # 最近媒体缓存（按会话维度）：[{path,type,name,timestamp}]
+        self.recent_media: Dict[str, List[Dict[str, Any]]] = {}
+
         logger.info(f"[FileHub] root_dir={self.root_dir} registry={self.registry_file}")
 
         # 如插件配置提供了 callback_api_base，则写入 AstrBot 全局配置，省去手动改 cmd_config.json
@@ -72,6 +77,50 @@ class FileHubPlugin(Star):
             return os.path.getsize(path) / (1024 * 1024)
         except Exception:
             return 0.0
+
+    def _save_registry(self, reg: Dict[str, Any]):
+        """保存索引 JSON 到磁盘。"""
+        path = resolve_registry_path(self.root_dir, self.registry_file)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(reg, f, ensure_ascii=False, indent=2)
+
+    def _unique_id(self, files: List[Dict[str, Any]], base: str) -> str:
+        """基于 base 生成唯一 id。"""
+        uid = base
+        i = 1
+        ids = {str(x.get("id")) for x in files}
+        while uid in ids:
+            i += 1
+            uid = f"{base}_{i}"
+        return uid
+
+    def _copy_into_root(self, abs_src: str, preferred_slug: str) -> Tuple[str, str]:
+        """复制文件到 root_dir/saved/，返回 (relpath, final_name)。"""
+        os.makedirs(self.root_dir, exist_ok=True)
+        subdir = os.path.join(self.root_dir, "saved")
+        os.makedirs(subdir, exist_ok=True)
+        ext = os.path.splitext(abs_src)[1]
+        slug = self._slugify(preferred_slug) or "file"
+        name = f"{slug}{ext}"
+        dst = os.path.join(subdir, name)
+        seq = 1
+        while os.path.exists(dst):
+            name = f"{slug}_{seq}{ext}"
+            dst = os.path.join(subdir, name)
+            seq += 1
+        shutil.copy2(abs_src, dst)
+        relp = os.path.relpath(dst, self.root_dir)
+        return relp, name
+
+    def _remember_media(self, origin: str, item: Dict[str, Any]):
+        """记录最近媒体（最多 5 个，1 小时内有效）。"""
+        bucket = self.recent_media.setdefault(origin, [])
+        bucket.append(item)
+        now = time.time()
+        bucket[:] = [x for x in bucket if now - x.get("timestamp", 0) <= 3600]
+        if len(bucket) > 5:
+            del bucket[:-5]
 
     def _has_access(self, entry: Dict[str, Any], group_id: str, sender_id: str) -> bool:
         return has_access(
@@ -105,6 +154,65 @@ class FileHubPlugin(Star):
             yield event.plain_result("未找到匹配的文件。")
             return
         lines = ["候选："] + ["- " + _format_entry_brief(e) for _, e in scored[:20]]
+        yield event.plain_result("\n".join(lines))
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def _capture_recent_media(self, event: AstrMessageEvent):
+        """捕获最近收到的图片/文件，供“自然语言保存”使用（不回消息）。"""
+        try:
+            comps = event.message_obj.message or []
+            if not comps:
+                return
+            origin = event.unified_msg_origin
+            found = False
+            for comp in comps:
+                if isinstance(comp, Comp.Image):
+                    try:
+                        path = await comp.convert_to_file_path()
+                        if path and os.path.exists(path):
+                            self._remember_media(origin, {
+                                "path": os.path.abspath(path),
+                                "type": "image",
+                                "name": os.path.basename(path),
+                                "timestamp": time.time(),
+                            })
+                            found = True
+                    except Exception:
+                        pass
+                if isinstance(comp, Comp.File):
+                    try:
+                        path = await comp.get_file()
+                        if path and os.path.exists(path):
+                            self._remember_media(origin, {
+                                "path": os.path.abspath(path),
+                                "type": "file",
+                                "name": comp.name or os.path.basename(path),
+                                "timestamp": time.time(),
+                            })
+                            found = True
+                    except Exception:
+                        pass
+            if found:
+                logger.debug("[FileHub] 捕获到最近媒体，已缓存供保存使用。")
+        except Exception as e:
+            logger.debug(f"[FileHub] 捕获媒体失败: {e}")
+
+    @filehub.command("info")
+    async def info(self, event: AstrMessageEvent):
+        """查看根目录、索引状态与关键配置。"""
+        reg, used_path = load_registry(self.root_dir, self.registry_file)
+        total = len(reg.get("files", []))
+        cb = ""
+        try:
+            cb = str(self.context.get_config().get("callback_api_base") or "")
+        except Exception:
+            pass
+        lines = [
+            f"root_dir: {self.root_dir}",
+            f"registry: {used_path}",
+            f"entries: {total}",
+            f"callback_api_base: {cb or '(未设置)'}",
+        ]
         yield event.plain_result("\n".join(lines))
 
     @filehub.command("set_callback")
@@ -177,7 +285,120 @@ class FileHubPlugin(Star):
         yield event.chain_result([Comp.File(name=name, file=abs_path)])
         return
 
+    @filehub.command("show")
+    async def show(self, event: AstrMessageEvent, file_id: str):
+        """查看单项详情（路径/大小/权限等）。"""
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        group_id = event.get_group_id() or ""
+        sender_id = event.get_sender_id() or ""
+        e = next((x for x in reg.get("files", []) if str(x.get("id")) == str(file_id)), None)
+        if not e:
+            yield event.plain_result(f"未找到 id={file_id} 的条目。")
+            return
+        can = self._has_access(e, group_id, sender_id)
+        abs_path = normalize_abs_path(self.root_dir, str(e.get("path", "")))
+        exists = os.path.exists(abs_path)
+        size_mb = self._get_file_size_mb(abs_path) if exists else 0.0
+        lines = [
+            f"id: {e.get('id')}",
+            f"name: {e.get('name')}",
+            f"path: {e.get('path')}\nabs: {abs_path}",
+            f"exists: {exists} size: {size_mb:.2f}MB",
+            f"send_as: {e.get('send_as','auto')} is_image: {is_image(abs_path)}",
+            f"description: {e.get('description','')}",
+            f"tags: {', '.join(map(str, e.get('tags') or []))}",
+            f"you_can_access: {can}",
+        ]
+        perms = e.get("permissions") or {}
+        allow = perms.get("allow") or {}
+        deny = perms.get("deny") or {}
+        lines += [
+            f"allow.users: {', '.join(map(str, allow.get('users') or []))}",
+            f"allow.groups: {', '.join(map(str, allow.get('groups') or []))}",
+            f"deny.users: {', '.join(map(str, deny.get('users') or []))}",
+            f"deny.groups: {', '.join(map(str, deny.get('groups') or []))}",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    @filehub.command("probe")
+    async def probe(self, event: AstrMessageEvent, file_id: str):
+        """诊断路径映射/回调服务可用性，辅助排障。"""
+        from astrbot.core.utils.path_util import path_Mapping
+
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        e = next((x for x in reg.get("files", []) if str(x.get("id")) == str(file_id)), None)
+        if not e:
+            yield event.plain_result(f"未找到 id={file_id} 的条目。")
+            return
+        abs_path = normalize_abs_path(self.root_dir, str(e.get("path", "")))
+        exists = os.path.exists(abs_path)
+
+        conf = self.context.get_config()
+        cb = str(conf.get("callback_api_base") or "")
+        plat = (event.get_platform_name() or "").lower()
+        pm = (conf.get("platform_settings", {}) or {}).get("path_mapping", [])
+        mapped = path_Mapping(pm, abs_path) if pm else abs_path
+        lines = [
+            f"platform: {plat}",
+            f"abs_path: {abs_path}",
+            f"exists_on_host: {exists}",
+            f"path_mapping_rules: {pm if pm else '[]'}",
+            f"mapped_path(for adapter): {mapped}",
+            f"callback_api_base: {cb or '(未设置)'}",
+        ]
+        if cb:
+            try:
+                url = await Comp.File(name=e.get("name") or os.path.basename(abs_path), file=abs_path).register_to_file_service()
+                lines.append(f"registered_url: {url}")
+            except Exception as er:
+                lines.append(f"register_failed: {er}")
+        yield event.plain_result("\n".join(lines))
+
     # =============== LLM 工具 ===============
+
+    @filter.llm_tool(name="save_recent_file")
+    async def tool_save_recent_file(
+        self,
+        event: AstrMessageEvent,
+        name: str,
+        description: str = "",
+        tags: List[str] | None = None,
+        send_as: str = "auto",
+    ) -> MessageEventResult:
+        """保存最近一次用户发送的图片或文件到文件库并写入索引。
+
+        适配 QQ 手机版无法同时发文本+文件：先发文件，再发文本说明保存与元数据。
+        """
+        origin = event.unified_msg_origin
+        bucket = self.recent_media.get(origin, [])
+        if not bucket:
+            yield event.plain_result("未检测到最近发送的媒体，请先发送图片或文件，再说明要保存。")
+            return
+        last = bucket[-1]
+        abs_src = last.get("path")
+        if not abs_src or not os.path.exists(abs_src):
+            yield event.plain_result("最近媒体不可用或已过期，请重试发送。")
+            return
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        files = reg.get("files", [])
+        base_slug = self._slugify(name or os.path.splitext(os.path.basename(abs_src))[0])
+        relp, final_name = self._copy_into_root(abs_src, base_slug)
+        uid = self._unique_id(files, base_slug)
+        entry = {
+            "id": uid,
+            "path": relp,
+            "name": final_name,
+            "description": description or "",
+            "tags": list(tags or []),
+            "send_as": (send_as or "auto").lower(),
+            "permissions": {"allow": {"users": [], "groups": []}, "deny": {"users": [], "groups": []}},
+        }
+        files.append(entry)
+        try:
+            self._save_registry({"files": files})
+            yield event.plain_result(f"已保存：{final_name} (id={uid})")
+        except Exception as e:
+            yield event.plain_result(f"写入索引失败：{e}")
 
     @filter.llm_tool(name="search_local_files")
     async def tool_search_files(self, event: AstrMessageEvent, query: str) -> MessageEventResult:
@@ -365,6 +586,59 @@ class FileHubPlugin(Star):
             contexts=[],
         )
 
+    # =============== 维护命令：删除与更新 ===============
+
+    @filehub.command("remove")
+    async def remove_entry(self, event: AstrMessageEvent, file_id: str):
+        """从索引中移除条目（不删除物理文件）。"""
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        files = reg.get("files", [])
+        new_files = [e for e in files if str(e.get("id")) != str(file_id)]
+        if len(new_files) == len(files):
+            yield event.plain_result(f"未找到 id={file_id} 的条目。")
+            return
+        try:
+            self._save_registry({"files": new_files})
+            yield event.plain_result(f"已移除 id={file_id}。")
+        except Exception as e:
+            yield event.plain_result(f"保存失败：{e}")
+
+    @filehub.command("update")
+    async def update_entry(self, event: AstrMessageEvent, file_id: str, field: str, value: str = GreedyStr):
+        """更新索引条目字段。
+
+        用法：/filehub update <id> <field> <value>
+        - field 可为 name|desc|tags|send_as
+        - tags 用逗号分隔，如：标签1,标签2
+        """
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        files = reg.get("files", [])
+        e = next((x for x in files if str(x.get("id")) == str(file_id)), None)
+        if not e:
+            yield event.plain_result(f"未找到 id={file_id} 的条目。")
+            return
+        field = (field or "").lower()
+        if field == "name":
+            e["name"] = value.strip()
+        elif field in {"desc", "description"}:
+            e["description"] = value.strip()
+        elif field == "tags":
+            e["tags"] = [t.strip() for t in (value or "").split(",") if t.strip()]
+        elif field == "send_as":
+            v = (value or "auto").lower()
+            if v not in {"auto", "image", "file"}:
+                yield event.plain_result("send_as 仅支持 auto|image|file")
+                return
+            e["send_as"] = v
+        else:
+            yield event.plain_result("不支持的字段，请使用 name|desc|tags|send_as")
+            return
+        try:
+            self._save_registry({"files": files})
+            yield event.plain_result("已更新。")
+        except Exception as e:
+            yield event.plain_result(f"保存失败：{e}")
+
     # =============== 辅助命令：扫描并写入索引 ===============
 
     # =============== 辅助命令：扫描并写入索引 ===============
@@ -381,9 +655,17 @@ class FileHubPlugin(Star):
         files = reg.get("files", [])
         known_abs = {os.path.abspath(normalize_abs_path(self.root_dir, f.get("path", ""))) for f in files}
         add_cnt = 0
+        index_abs = os.path.abspath(resolve_registry_path(self.root_dir, self.registry_file))
         for root, dirs, fnames in os.walk(self.root_dir):
+            # 跳过隐藏目录
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
             for fn in fnames:
+                if fn.startswith('.'):
+                    continue
                 fp = os.path.join(root, fn)
+                # 跳过索引文件本身
+                if os.path.abspath(fp) == index_abs:
+                    continue
                 if mode == "images" and not is_image(fp):
                     continue
                 abp = os.path.abspath(fp)
@@ -415,6 +697,7 @@ class FileHubPlugin(Star):
         # 保存
         try:
             path = resolve_registry_path(self.root_dir, self.registry_file)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({"files": files}, f, ensure_ascii=False, indent=2)
             yield event.plain_result(f"索引完成，新增 {add_cnt} 条，写入：{path}")
