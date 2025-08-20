@@ -586,6 +586,58 @@ class FileHubPlugin(Star):
             contexts=[],
         )
 
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def natural_save_request(self, event: AstrMessageEvent):
+        """自然语言触发“保存最近媒体”。
+
+        触发条件：消息包含保存意图且缓存中存在最近媒体。
+        行为：发起一次 LLM 请求，强制调用 save_recent_file 工具解析用户给出的名称/标签/描述。
+        """
+        text = (event.message_str or "").strip()
+        if not text:
+            return
+        # 关键词判断：尽量收敛触发，避免误伤其他对话
+        intents = ["保存", "存一下", "存图", "存这个", "加入文件库", "收藏", "存下"]
+        if not any(k in text for k in intents):
+            return
+        bucket = self.recent_media.get(event.unified_msg_origin, [])
+        if not bucket:
+            # 没有可保存的媒体，礼貌提示
+            yield event.plain_result("我可以帮你保存最近发送的图片/文件，请先发送媒体，再告诉我要保存和名称。")
+            event.stop_event()
+            return
+        # 构造 System Prompt，强约束使用工具
+        sys_prompt = (
+            "你是文件入库助手。用户说要保存最近的图片或文件时，必须调用 save_recent_file(name, description, tags, send_as)。\n"
+            "规范：\n"
+            "- name：尽量从用户话里提取最简短易懂的名称（如只给了短语，则用该短语作为 name）；\n"
+            "- description：保留用户额外描述；\n"
+            "- tags：从逗号/空格/顿号分隔的词里提取标签，如未提供可空；\n"
+            "- send_as：若最近媒体是图片则用 'image'，若是普通文件则用 'file'，否则 'auto'；\n"
+            "- 仅调用一次工具；成功后不要重复输出其他内容。\n"
+        )
+        # 选择 provider（与“找文件”一致的策略）
+        func_tools_mgr = self.context.get_llm_tool_manager()
+        try:
+            conf = self.context.get_config()
+            default_pid = (conf.get("provider_settings", {}) or {}).get("default_provider_id") or ""
+            pid = default_pid.strip()
+            if not pid:
+                provs = self.context.get_all_providers() or []
+                if provs:
+                    pid = provs[0].meta().id
+            if pid:
+                event.set_extra("selected_provider", pid)
+        except Exception:
+            pass
+        # 将原始用户文本作为 prompt，让模型解析字段并调用工具
+        yield event.request_llm(
+            prompt=text,
+            func_tool_manager=func_tools_mgr,
+            system_prompt=sys_prompt,
+            contexts=[],
+        )
+
     # =============== 维护命令：删除与更新 ===============
 
     @filehub.command("remove")
