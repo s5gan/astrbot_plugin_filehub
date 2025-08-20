@@ -4,16 +4,19 @@ import json
 import time
 import shutil
 from typing import List, Dict, Any, Optional, Tuple
+import base64
 from .registry import load_registry, resolve_registry_path
 from .permissions import norm_list_str, has_access
 from .file_ops import is_image, is_valid_image_file, normalize_abs_path
 from .search import search_entries, format_entry_brief
 
 import astrbot.api.message_components as Comp
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.api import logger
+from astrbot.core.utils.io import download_file
  
 
 
@@ -26,8 +29,7 @@ DEFAULT_REGISTRY = "registry.json"
 def _format_entry_brief(entry: Dict[str, Any]) -> str:
     name = entry.get("name") or os.path.basename(str(entry.get("path", "")))
     desc = entry.get("description") or ""
-    tags = entry.get("tags") or []
-    return f"{entry.get('id','')} | {name} | {desc} | tags: {', '.join(map(str,tags))}"
+    return f"{entry.get('id','')} | {name} | {desc}"
 
 
 @register("astrbot_plugin_filehub", "awa", "本地文件检索与发送插件", "0.1.0", "")
@@ -121,6 +123,39 @@ class FileHubPlugin(Star):
         bucket[:] = [x for x in bucket if now - x.get("timestamp", 0) <= 3600]
         if len(bucket) > 5:
             del bucket[:-5]
+
+    async def _send_image_safely(self, event: AstrMessageEvent, abs_path: str, name: str) -> None:
+        """在不同平台下尽量可靠地发送图片。
+
+        优先使用回调URL（需要 callback_api_base），否则回退 base64，再回退本地文件路径。
+        """
+        plat = (event.get_platform_name() or "").lower()
+        try:
+            conf = self.context.get_config()
+            cb = str(conf.get("callback_api_base") or "").strip()
+        except Exception:
+            cb = ""
+
+        # 优先：回调URL（Napcat/go-cqhttp 可靠）
+        if cb:
+            try:
+                url = await Comp.File(name=name, file=abs_path).register_to_file_service()
+                await event.send(MessageChain([Comp.Image.fromURL(url)]))
+                return
+            except Exception:
+                pass
+
+        # 其次：base64
+        try:
+            with open(abs_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            await event.send(MessageChain([Comp.Image.fromBase64(b64)]))
+            return
+        except Exception:
+            pass
+
+        # 最后：本地文件路径
+        await event.send(MessageChain([Comp.Image.fromFileSystem(abs_path)]))
 
     def _has_access(self, entry: Dict[str, Any], group_id: str, sender_id: str) -> bool:
         return has_access(
@@ -259,7 +294,7 @@ class FileHubPlugin(Star):
             if not is_valid_image_file(abs_path):
                 yield event.plain_result(f"图片文件无效或已损坏：{name}")
                 return
-            yield event.chain_result([Comp.Image.fromFileSystem(abs_path)])
+            await self._send_image_safely(event, abs_path, name)
             return
         # 非图片文件：针对不同平台选择合适策略
         if plat == "aiocqhttp":
@@ -362,17 +397,38 @@ class FileHubPlugin(Star):
         name: str = "",
         description: str = "",
         send_as: str = "auto",
+        which: int = -1,
+        prefer_type: str = "any",
     ) -> MessageEventResult:
-        """保存最近一次用户发送的图片或文件到文件库并写入索引。
+        """保存最近发送的图片/文件到文件库并写入索引。
 
-        适配 QQ 手机版无法同时发文本+文件：先发文件，再发文本说明保存与元数据。
+        参数:
+        - name(string): 条目名称（缺省从消息文本或原文件名推断）
+        - description(string): 描述
+        - send_as(string): auto|image|file（默认 auto）
+        - which(number): 选取第几个最近媒体，-1 表示最后一个
+        - prefer_type(string): any|image|file（仅在存在多种媒体时用于筛选）
         """
         origin = event.unified_msg_origin
-        bucket = self.recent_media.get(origin, [])
+        bucket = list(self.recent_media.get(origin, []))
         if not bucket:
             yield event.plain_result("未检测到最近发送的媒体，请先发送图片或文件，再说明要保存。")
             return
-        last = bucket[-1]
+        prefer_type = (prefer_type or "any").lower()
+        if prefer_type in {"image", "file"}:
+            bucket = [x for x in bucket if x.get("type") == prefer_type]
+            if not bucket:
+                yield event.plain_result("未找到符合类型的媒体，请调整 prefer_type。")
+                return
+        # 选择项
+        idx = which if which is not None else -1
+        if idx < 0:
+            last = bucket[-1]
+        else:
+            if idx >= len(bucket):
+                yield event.plain_result("which 超出范围。")
+                return
+            last = bucket[idx]
         abs_src = last.get("path")
         if not abs_src or not os.path.exists(abs_src):
             yield event.plain_result("最近媒体不可用或已过期，请重试发送。")
@@ -411,8 +467,206 @@ class FileHubPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"写入索引失败：{e}")
 
+    @filter.llm_tool(name="save_file_from_url")
+    async def tool_save_file_from_url(
+        self,
+        event: AstrMessageEvent,
+        url: str,
+        name: str = "",
+        description: str = "",
+        send_as: str = "auto",
+    ) -> MessageEventResult:
+        """从 HTTP(S) 链接保存文件到文件库并写入索引。
+
+        参数:
+        - url(string): 以 http/https 开头的下载链接
+        - name(string): 可选名称（未提供时从 URL 文件名推断）
+        - description(string): 描述
+        - send_as(string): auto|image|file（默认 auto，按扩展名兜底）
+        """
+        u = (url or "").strip()
+        if not (u.startswith("http://") or u.startswith("https://")):
+            yield event.plain_result("请提供以 http:// 或 https:// 开头的 URL")
+            return
+        # 下载到临时路径
+        tmp_dir = os.path.join(self.root_dir, ".tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_path = os.path.join(tmp_dir, os.path.basename(u) or "download.bin")
+        try:
+            await download_file(u, tmp_path)
+        except Exception as e:
+            yield event.plain_result(f"下载失败：{e}")
+            return
+        # 生成条目
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        files = reg.get("files", [])
+        nm = (name or os.path.splitext(os.path.basename(tmp_path))[0]).strip() or "file"
+        base_slug = self._slugify(nm)
+        s_as = (send_as or "auto").lower()
+        if s_as == "auto":
+            s_as = "image" if is_image(tmp_path) else "file"
+        relp, final_name = self._copy_into_root(tmp_path, base_slug)
+        try:
+            # 清理临时文件
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            uid = self._unique_id(files, base_slug)
+            entry = {
+                "id": uid,
+                "path": relp,
+                "name": final_name,
+                "description": (description or "").strip(),
+                "send_as": s_as,
+                "permissions": {"allow": {"users": [], "groups": []}, "deny": {"users": [], "groups": []}},
+            }
+            files.append(entry)
+            self._save_registry({"files": files})
+            yield event.plain_result(f"已保存：{final_name} (id={uid})")
+        except Exception as e:
+            yield event.plain_result(f"写入索引失败：{e}")
+
+    @filter.llm_tool(name="update_file_metadata")
+    async def tool_update_file_metadata(
+        self,
+        event: AstrMessageEvent,
+        file_id: str,
+        name: str = "",
+        description: str = "",
+        send_as: str = "",
+    ) -> MessageEventResult:
+        """更新文件元数据。
+
+        参数:
+        - file_id(string): 索引中的 ID
+        - name(string): 新名称（可选）
+        - description(string): 新描述（可选）
+        - send_as(string): auto|image|file（可选）
+        - add_tags(array): 追加的标签
+        - remove_tags(array): 要移除的标签
+        """
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        files = reg.get("files", [])
+        e = next((x for x in files if str(x.get("id")) == str(file_id)), None)
+        if not e:
+            yield event.plain_result("未找到该文件条目。")
+            return
+        if name:
+            e["name"] = name.strip()
+        if description:
+            e["description"] = description.strip()
+        if send_as:
+            v = send_as.strip().lower()
+            if v not in {"auto", "image", "file"}:
+                yield event.plain_result("send_as 仅支持 auto|image|file")
+                return
+            e["send_as"] = v
+        try:
+            self._save_registry({"files": files})
+            yield event.plain_result("已更新元数据。")
+        except Exception as err:
+            yield event.plain_result(f"保存失败：{err}")
+
+    @filter.llm_tool(name="get_registry")
+    async def tool_get_registry(self, event: AstrMessageEvent):
+        """返回可访问条目的 registry.json 内容（JSON）。
+
+        说明：为避免越权泄露，仅返回当前会话可访问的条目子集；结构与原 registry 类似。
+        """
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        group_id = event.get_group_id() or ""
+        sender_id = event.get_sender_id() or ""
+        entries = [e for e in reg.get("files", []) if self._has_access(e, group_id, sender_id)]
+        payload = {"files": entries}
+        return json.dumps(payload, ensure_ascii=False)
+
+    @filter.llm_tool(name="delete_file_by_id")
+    async def tool_delete_file_by_id(
+        self,
+        event: AstrMessageEvent,
+        file_id: str,
+        remove_physical: str = "no",
+    ) -> MessageEventResult:
+        """删除文件条目；可选删除物理文件。
+
+        参数:
+        - file_id(string): 索引中的 ID
+        - remove_physical(string): yes|no，是否删除物理文件（默认 no）
+        """
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        files = reg.get("files", [])
+        e = next((x for x in files if str(x.get("id")) == str(file_id)), None)
+        if not e:
+            yield event.plain_result("未找到该文件条目。")
+            return
+        # 物理删除
+        if str(remove_physical).lower() in {"y", "yes", "true", "1"}:
+            abs_path = normalize_abs_path(self.root_dir, str(e.get("path", "")))
+            try:
+                if abs_path and os.path.exists(abs_path):
+                    os.remove(abs_path)
+            except Exception:
+                pass
+        new_files = [x for x in files if str(x.get("id")) != str(file_id)]
+        try:
+            self._save_registry({"files": new_files})
+            yield event.plain_result("已删除条目。")
+        except Exception as err:
+            yield event.plain_result(f"保存失败：{err}")
+
+    @filter.llm_tool(name="set_file_permissions")
+    async def tool_set_file_permissions(
+        self,
+        event: AstrMessageEvent,
+        file_id: str,
+        allow_users: List[str] | None = None,
+        allow_groups: List[str] | None = None,
+        deny_users: List[str] | None = None,
+        deny_groups: List[str] | None = None,
+        mode: str = "merge",
+    ) -> MessageEventResult:
+        """设置文件权限（合并或替换）。
+
+        参数:
+        - file_id(string): 索引中的 ID
+        - allow_users(array): 允许的用户 ID 列表
+        - allow_groups(array): 允许的群 ID 列表
+        - deny_users(array): 拒绝的用户 ID 列表
+        - deny_groups(array): 拒绝的群 ID 列表
+        - mode(string): merge|replace，merge 为在原有基础上增改，replace 为覆盖
+        """
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        files = reg.get("files", [])
+        e = next((x for x in files if str(x.get("id")) == str(file_id)), None)
+        if not e:
+            yield event.plain_result("未找到该文件条目。")
+            return
+        perms = e.get("permissions") or {"allow": {"users": [], "groups": []}, "deny": {"users": [], "groups": []}}
+        if (mode or "merge").lower() == "replace":
+            perms = {"allow": {"users": [], "groups": []}, "deny": {"users": [], "groups": []}}
+        # 合并
+        if allow_users is not None:
+            perms.setdefault("allow", {}).setdefault("users", [])
+            perms["allow"]["users"] = list({*map(str, perms["allow"]["users"]), *map(str, allow_users)})
+        if allow_groups is not None:
+            perms.setdefault("allow", {}).setdefault("groups", [])
+            perms["allow"]["groups"] = list({*map(str, perms["allow"]["groups"]), *map(str, allow_groups)})
+        if deny_users is not None:
+            perms.setdefault("deny", {}).setdefault("users", [])
+            perms["deny"]["users"] = list({*map(str, perms["deny"]["users"]), *map(str, deny_users)})
+        if deny_groups is not None:
+            perms.setdefault("deny", {}).setdefault("groups", [])
+            perms["deny"]["groups"] = list({*map(str, perms["deny"]["groups"]), *map(str, deny_groups)})
+        e["permissions"] = perms
+        try:
+            self._save_registry({"files": files})
+            yield event.plain_result("已更新权限。")
+        except Exception as err:
+            yield event.plain_result(f"保存失败：{err}")
+
     @filter.llm_tool(name="search_local_files")
-    async def tool_search_files(self, event: AstrMessageEvent, query: str) -> MessageEventResult:
+    async def tool_search_files(self, event: AstrMessageEvent, query: str):
         """搜索本地文件。
 
         Args:
@@ -424,10 +678,7 @@ class FileHubPlugin(Star):
         sender_id = event.get_sender_id() or ""
         entries = [e for e in reg.get("files", []) if self._has_access(e, group_id, sender_id)]
         scored = search_entries(entries, query)
-        if not scored:
-            yield event.plain_result("未找到匹配的文件。")
-            return
-        # 输出结构化 JSON，便于 LLM 稳定解析 id
+        # 返回结构化结果（字符串），供 LLM 消化（不直接向用户输出）
         items = []
         for _, e in scored[:10]:
             items.append({
@@ -441,10 +692,10 @@ class FileHubPlugin(Star):
                     else (is_image(str(e.get("path", ""))) if (e.get("send_as") or "auto") == "auto" else False)
                 ),
             })
-        yield event.plain_result(json.dumps({"results": items}, ensure_ascii=False))
+        return json.dumps({"results": items}, ensure_ascii=False)
 
     @filter.llm_tool(name="send_local_file_by_id")
-    async def tool_send_file_by_id(self, event: AstrMessageEvent, file_id: str) -> MessageEventResult:
+    async def tool_send_file_by_id(self, event: AstrMessageEvent, file_id: str):
         """按 id 发送本地文件。
 
         Args:
@@ -457,45 +708,35 @@ class FileHubPlugin(Star):
         entries = reg.get("files", [])
         match = next((e for e in entries if str(e.get("id")) == str(file_id)), None)
         if not match:
-            yield event.plain_result(f"未找到 id={file_id} 的文件。")
-            return
+            return f"ERROR not_found id={file_id}"
         if not self._has_access(match, group_id, sender_id):
-            yield event.plain_result("没有权限发送该文件。")
-            return
+            return f"ERROR no_permission id={file_id}"
         abs_path = normalize_abs_path(self.root_dir, str(match.get("path", "")))
         if not os.path.exists(abs_path):
-            yield event.plain_result(f"文件不存在：{abs_path}")
-            return
+            return f"ERROR missing_file id={file_id}"
         name = match.get("name") or os.path.basename(abs_path)
         send_as = (match.get("send_as") or "auto").lower()
 
         plat = (event.get_platform_name() or "").lower()
         is_img = send_as == "image" or (send_as == "auto" and is_image(abs_path))
         if is_img:
-            yield event.plain_result(f"正在发送：{name}（id={file_id}）")
-            yield event.chain_result([Comp.Image.fromFileSystem(abs_path)])
-            return
+            await self._send_image_safely(event, abs_path, name)
+            return f"SENT id={file_id} name={name}"
         if plat == "aiocqhttp":
-            yield event.plain_result(f"正在发送：{name}（id={file_id}）")
-            if self.max_file_size_mb and self.max_file_size_mb > 0:
-                size_mb = self._get_file_size_mb(abs_path)
-                if size_mb > self.max_file_size_mb:
-                    yield event.plain_result(
-                        f"文件大小 {size_mb:.1f}MB 超过阈值 {self.max_file_size_mb}MB，仍尝试发送（将走回调拉取）。"
-                    )
-            yield event.chain_result([Comp.File(name=name, file=abs_path)])
-            return
+            await event.send(MessageChain([Comp.File(name=name, file=abs_path)]))
+            return f"SENT id={file_id} name={name}"
         if plat in {"qq_official", "weixin_official_account", "dingtalk"}:
             try:
                 url = await Comp.File(name=name, file=abs_path).register_to_file_service()
-                yield event.plain_result(f"{name}: {url}")
-                return
+                await event.send(MessageChain().message(f"{name}: {url}"))
+                return f"SENT id={file_id} name={name} url={url}"
             except Exception:
                 pass
-        yield event.chain_result([Comp.File(name=name, file=abs_path)])
+        await event.send(MessageChain([Comp.File(name=name, file=abs_path)]))
+        return f"SENT id={file_id} name={name}"
 
     @filter.llm_tool(name="find_and_send")
-    async def tool_find_and_send(self, event: AstrMessageEvent, query: str) -> MessageEventResult:
+    async def tool_find_and_send(self, event: AstrMessageEvent, query: str):
         """按关键词检索并直接发送最匹配的文件。
 
         Args:
@@ -508,25 +749,18 @@ class FileHubPlugin(Star):
         entries = [e for e in reg.get("files", []) if self._has_access(e, group_id, sender_id)]
         scored = search_entries(entries, query)
         if not scored:
-            yield event.plain_result("未找到匹配的文件。")
-            return
-        # 如果存在多个高分候选，则直接列出候选，请用户选择具体 id
+            return "CANDIDATES 0"
+        # 多候选：返回候选让 LLM 决策
         if len(scored) > 1:
-            choices = [
-                f"- { _format_entry_brief(e) }" for _, e in scored[:10]
-            ]
-            tips = (
-                "检测到多个候选，请回复要发送的 id，"
-                "或使用指令：/filehub send <id>"
-            )
-            yield event.plain_result("找到多个匹配：\n" + "\n".join(choices) + "\n" + tips)
-            return
+            lines = ["CANDIDATES"]
+            for _, e in scored[:10]:
+                lines.append(_format_entry_brief(e))
+            return "\n".join(lines)
 
         top = scored[0][1]
         abs_path = normalize_abs_path(self.root_dir, str(top.get("path", "")))
         if not os.path.exists(abs_path):
-            yield event.plain_result(f"文件不存在：{abs_path}")
-            return
+            return "ERROR missing_file"
         name = top.get("name") or os.path.basename(abs_path)
         file_id = top.get("id")
         send_as = (top.get("send_as") or "auto").lower()
@@ -534,23 +768,21 @@ class FileHubPlugin(Star):
         is_img = send_as == "image" or (send_as == "auto" and is_image(abs_path))
         if is_img:
             if not is_valid_image_file(abs_path):
-                yield event.plain_result(f"图片文件无效或已损坏：{name}")
-                return
-            yield event.plain_result(f"已选择并发送：{name}（id={file_id}）")
-            yield event.chain_result([Comp.Image.fromFileSystem(abs_path)])
-            return
+                return "ERROR invalid_image"
+            await self._send_image_safely(event, abs_path, name)
+            return f"SENT id={file_id} name={name}"
         if plat == "aiocqhttp":
-            yield event.plain_result(f"已选择并发送：{name}（id={file_id}）")
-            yield event.chain_result([Comp.File(name=name, file=abs_path)])
-            return
+            await event.send(MessageChain([Comp.File(name=name, file=abs_path)]))
+            return f"SENT id={file_id} name={name}"
         if plat in {"qq_official", "weixin_official_account", "dingtalk"}:
             try:
                 url = await Comp.File(name=name, file=abs_path).register_to_file_service()
-                yield event.plain_result(f"{name}: {url}")
-                return
+                await event.send(MessageChain().message(f"{name}: {url}"))
+                return f"SENT id={file_id} name={name} url={url}"
             except Exception:
                 pass
-        yield event.chain_result([Comp.File(name=name, file=abs_path)])
+        await event.send(MessageChain([Comp.File(name=name, file=abs_path)]))
+        return f"SENT id={file_id} name={name}"
 
     # =============== 触发 LLM 的入口指令 ===============
 
@@ -561,12 +793,13 @@ class FileHubPlugin(Star):
         用法：/找文件 关键字
         """
         prompt = (
-            "你是文件助理。严格使用函数工具完成文件检索与发送：\n"
-            "1) 若用户需求明确且只有一个匹配，调用 find_and_send(query) 直接发送；\n"
-            "2) 若存在多个候选，调用 find_and_send(query) 让工具列出候选供用户选择，切勿自行臆断；\n"
-            "3) 如需分步，先 search_local_files(query) 再 send_local_file_by_id(id)；\n"
-            "4) 未找到则清晰说明并建议用户换关键词；\n"
-            "5) 严格遵循索引权限，不越权访问。"
+            "你是文件助理。先调用 get_registry() 获取可访问条目（不要把 registry 内容直接发给用户），"
+            "阅读其中的 id、name、description、path、send_as，基于用户需求自行判断最合适的条目。\n"
+            "- 若能唯一确定条目，调用 send_local_file_by_id(id) 发送；\n"
+            "- 若存在多个候选，请整理候选并让用户选择 id；\n"
+            "- 未找到合适条目时，明确告知并建议更换关键词；\n"
+            "- 工具调用完成后，再发送一句简短的自然语言确认（例如：已发送 项目Logo.png）；\n"
+            "- 严格遵循权限，不越权访问。"
         )
 
         query = (query or "").strip()
@@ -618,12 +851,14 @@ class FileHubPlugin(Star):
             return
         # 构造 System Prompt，强约束使用工具
         sys_prompt = (
-            "你是文件入库助手。用户说要保存最近的图片或文件时，必须调用 save_recent_file(name, description, send_as)。\n"
+            "你是文件入库助手。用户说要保存最近的图片或文件时，必须调用 save_recent_file(name, description, send_as, which, prefer_type)。\n"
             "规范：\n"
-            "- name：尽量从用户话里提取最简短易懂的名称（如只给了短语，则用该短语作为 name）；\n"
+            "- name：尽量从用户话里提取最简短易懂的名称；\n"
             "- description：保留用户额外描述；\n"
             "- send_as：若最近媒体是图片则用 'image'，若是普通文件则用 'file'，否则 'auto'；\n"
-            "- 仅调用一次工具；成功后不要重复输出其他内容。\n"
+            "- which 与 prefer_type 用于在多媒体时选择合适文件；\n"
+            "- 工具调用完成后，再发送一句简短的自然语言确认（例如：已保存 项目Logo.png）；\n"
+            "- 仅调用一次工具。\n"
         )
         # 选择 provider（与“找文件”一致的策略）
         func_tools_mgr = self.context.get_llm_tool_manager()
@@ -646,6 +881,19 @@ class FileHubPlugin(Star):
             system_prompt=sys_prompt,
             contexts=[],
         )
+
+    # =============== 全局 LLM 请求引导 ===============
+    @filter.on_llm_request()
+    async def steer_llm(self, event: AstrMessageEvent, req: ProviderRequest):
+        guide = (
+            "当用户请求发送/查找文件或图片（如‘发我’、‘发送’、‘给我’、‘找一下’、‘文件’、‘图片’、‘logo’等关键词出现），"
+            "请优先使用以下步骤：\n"
+            "1) 调用 get_registry() 获取可访问条目（不要把 registry 内容直接发给用户）；\n"
+            "2) 基于用户描述选择最合适的 id，调用 send_local_file_by_id(id) 发送文件；\n"
+            "3) 工具调用完成后，再发送一句简短的自然语言确认（例如：已发送 项目Logo.png）。\n"
+            "如存在多个候选，请列出候选并让用户选择 id；若无合适条目，请明确告知并给出建议。"
+        )
+        req.system_prompt = (req.system_prompt or "") + "\n" + guide
 
     # =============== 维护命令：删除与更新 ===============
 
