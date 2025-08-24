@@ -5,9 +5,10 @@ import time
 import shutil
 from typing import List, Dict, Any, Optional, Tuple
 import base64
+from urllib.parse import urlparse
 from .registry import load_registry, resolve_registry_path
 from .permissions import norm_list_str, has_access
-from .file_ops import is_image, is_valid_image_file, normalize_abs_path
+from .file_ops import is_image, is_valid_image_file, normalize_abs_path, detect_extension_by_magic
 from .search import search_entries, format_entry_brief
 
 import astrbot.api.message_components as Comp
@@ -32,7 +33,7 @@ def _format_entry_brief(entry: Dict[str, Any]) -> str:
     return f"{entry.get('id','')} | {name} | {desc}"
 
 
-@register("astrbot_plugin_filehub", "awa", "本地文件检索与发送插件", "0.1.0", "")
+@register("astrbot_plugin_filehub", "awa", "本地文件检索与发送插件", "0.2.0", "")
 class FileHubPlugin(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
         super().__init__(context)
@@ -97,18 +98,27 @@ class FileHubPlugin(Star):
             uid = f"{base}_{i}"
         return uid
 
-    def _copy_into_root(self, abs_src: str, preferred_slug: str) -> Tuple[str, str]:
-        """复制文件到 root_dir/saved/，返回 (relpath, final_name)。"""
+    def _copy_into_root(self, abs_src: str, preferred_slug: str, original_name: Optional[str] = None) -> Tuple[str, str]:
+        """复制文件到 root_dir/saved/，返回 (relpath, final_name)。
+
+        - 实体文件名 = {preferred_slug}{.原后缀}；若源路径不含后缀，则尽力从 original_name 或魔数推断。
+        """
         os.makedirs(self.root_dir, exist_ok=True)
         subdir = os.path.join(self.root_dir, "saved")
         os.makedirs(subdir, exist_ok=True)
         ext = os.path.splitext(abs_src)[1]
+        if not ext and original_name:
+            ext = os.path.splitext(original_name)[1]
+        if not ext:
+            ext = detect_extension_by_magic(abs_src)
+        # 确保扩展名小写统一
+        ext = (ext or "").lower()
         slug = self._slugify(preferred_slug) or "file"
-        name = f"{slug}{ext}"
+        name = f"{slug}{ext}" if ext else slug
         dst = os.path.join(subdir, name)
         seq = 1
         while os.path.exists(dst):
-            name = f"{slug}_{seq}{ext}"
+            name = f"{slug}_{seq}{ext}" if ext else f"{slug}_{seq}"
             dst = os.path.join(subdir, name)
             seq += 1
         shutil.copy2(abs_src, dst)
@@ -205,10 +215,14 @@ class FileHubPlugin(Star):
                     try:
                         path = await comp.convert_to_file_path()
                         if path and os.path.exists(path):
+                            # 尝试捕获更准确的原始名称（优先组件携带的 name/url/file）
+                            comp_name = getattr(comp, "name", None) or os.path.basename(
+                                getattr(comp, "file", "") or getattr(comp, "url", "") or path
+                            )
                             self._remember_media(origin, {
                                 "path": os.path.abspath(path),
                                 "type": "image",
-                                "name": os.path.basename(path),
+                                "name": comp_name,
                                 "timestamp": time.time(),
                             })
                             found = True
@@ -218,10 +232,13 @@ class FileHubPlugin(Star):
                     try:
                         path = await comp.get_file()
                         if path and os.path.exists(path):
+                            comp_name = getattr(comp, "name", None) or os.path.basename(
+                                getattr(comp, "file", "") or getattr(comp, "url", "") or path
+                            )
                             self._remember_media(origin, {
                                 "path": os.path.abspath(path),
                                 "type": "file",
-                                "name": comp.name or os.path.basename(path),
+                                "name": comp_name,
                                 "timestamp": time.time(),
                             })
                             found = True
@@ -403,11 +420,12 @@ class FileHubPlugin(Star):
         """保存最近发送的图片/文件到文件库并写入索引。
 
         参数:
-        - name(string): 条目名称（缺省从消息文本或原文件名推断）
+        - name(string): 条目名称（不要包含扩展名；缺省将从消息文本推断）
         - description(string): 描述
         - send_as(string): auto|image|file（默认 auto）
         - which(number): 选取第几个最近媒体，-1 表示最后一个
         - prefer_type(string): any|image|file（仅在存在多种媒体时用于筛选）
+        说明：实体文件将严格保留原始后缀扩展名。
         """
         origin = event.unified_msg_origin
         bucket = list(self.recent_media.get(origin, []))
@@ -450,7 +468,7 @@ class FileHubPlugin(Star):
         s_as = (send_as or "auto").lower()
         if s_as == "auto":
             s_as = "image" if last.get("type") == "image" or is_image(abs_src) else "file"
-        relp, final_name = self._copy_into_root(abs_src, base_slug)
+        relp, final_name = self._copy_into_root(abs_src, base_slug, original_name=last.get("name"))
         uid = self._unique_id(files, base_slug)
         entry = {
             "id": uid,
@@ -480,18 +498,21 @@ class FileHubPlugin(Star):
 
         参数:
         - url(string): 以 http/https 开头的下载链接
-        - name(string): 可选名称（未提供时从 URL 文件名推断）
+        - name(string): 可选名称（不要包含扩展名；未提供时从 URL 文件名推断）
         - description(string): 描述
         - send_as(string): auto|image|file（默认 auto，按扩展名兜底）
+        说明：实体文件将严格保留下载到的原始后缀扩展名（会忽略 URL 查询串）。
         """
         u = (url or "").strip()
         if not (u.startswith("http://") or u.startswith("https://")):
             yield event.plain_result("请提供以 http:// 或 https:// 开头的 URL")
             return
-        # 下载到临时路径
+        # 下载到临时路径（尽量保留 URL 的原始扩展名，忽略查询串）
         tmp_dir = os.path.join(self.root_dir, ".tmp")
         os.makedirs(tmp_dir, exist_ok=True)
-        tmp_path = os.path.join(tmp_dir, os.path.basename(u) or "download.bin")
+        parsed = urlparse(u)
+        url_basename = os.path.basename(parsed.path) or "download.bin"
+        tmp_path = os.path.join(tmp_dir, url_basename)
         try:
             await download_file(u, tmp_path)
         except Exception as e:
@@ -500,12 +521,13 @@ class FileHubPlugin(Star):
         # 生成条目
         reg, _ = load_registry(self.root_dir, self.registry_file)
         files = reg.get("files", [])
+        # 实体文件名由 LLM 基于描述命名；严格保留原始后缀
         nm = (name or os.path.splitext(os.path.basename(tmp_path))[0]).strip() or "file"
         base_slug = self._slugify(nm)
         s_as = (send_as or "auto").lower()
         if s_as == "auto":
             s_as = "image" if is_image(tmp_path) else "file"
-        relp, final_name = self._copy_into_root(tmp_path, base_slug)
+        relp, final_name = self._copy_into_root(tmp_path, base_slug, original_name=url_basename)
         try:
             # 清理临时文件
             try:
@@ -853,12 +875,13 @@ class FileHubPlugin(Star):
         sys_prompt = (
             "你是文件入库助手。用户说要保存最近的图片或文件时，必须调用 save_recent_file(name, description, send_as, which, prefer_type)。\n"
             "规范：\n"
-            "- name：尽量从用户话里提取最简短易懂的名称；\n"
+            "- name：基于用户描述给出清晰、简短的文件名；不要包含扩展名；\n"
             "- description：保留用户额外描述；\n"
             "- send_as：若最近媒体是图片则用 'image'，若是普通文件则用 'file'，否则 'auto'；\n"
             "- which 与 prefer_type 用于在多媒体时选择合适文件；\n"
             "- 工具调用完成后，再发送一句简短的自然语言确认（例如：已保存 项目Logo.png）；\n"
             "- 仅调用一次工具。\n"
+            "系统会自动严格保留原始文件的后缀扩展名。"
         )
         # 选择 provider（与“找文件”一致的策略）
         func_tools_mgr = self.context.get_llm_tool_manager()
@@ -1008,5 +1031,68 @@ class FileHubPlugin(Star):
             yield event.plain_result(f"索引完成，新增 {add_cnt} 条，写入：{path}")
         except Exception as e:
             yield event.plain_result(f"写入索引失败：{e}")
+
+    @filehub.command("rename")
+    async def rename_entry(self, event: AstrMessageEvent, file_id: str, new_name: str = GreedyStr):
+        """重命名实体文件（支持修改后缀）并更新索引。
+
+        用法：/filehub rename <id> <新文件名>
+        说明：新文件名可包含后缀（如 report_v2.pdf）。若未提供后缀，则沿用原文件后缀。
+        """
+        reg, _ = load_registry(self.root_dir, self.registry_file)
+        files = reg.get("files", [])
+        e = next((x for x in files if str(x.get("id")) == str(file_id)), None)
+        if not e:
+            yield event.plain_result(f"未找到 id={file_id} 的条目。")
+            return
+        p = str(e.get("path", ""))
+        src_abs = normalize_abs_path(self.root_dir, p)
+        if not os.path.exists(src_abs):
+            yield event.plain_result(f"源文件不存在：{src_abs}")
+            return
+
+        new_name = (new_name or "").strip()
+        if not new_name:
+            yield event.plain_result("请提供新文件名，例如：/filehub rename logo 项目Logo_v2.png")
+            return
+
+        # 拆分新名称的主体与后缀；若未给出后缀则沿用原后缀
+        new_base, new_ext = os.path.splitext(new_name)
+        if not new_base:
+            yield event.plain_result("新文件名无效。")
+            return
+        slug = self._slugify(new_base)
+        if not slug:
+            yield event.plain_result("新文件名无效（仅字母数字与下划线）。")
+            return
+        old_ext = os.path.splitext(src_abs)[1]
+        ext = (new_ext or old_ext or "").lower()
+        final_name = f"{slug}{ext}" if ext else slug
+
+        # 同目录下生成唯一名称
+        dst_dir = os.path.dirname(src_abs)
+        dst_abs = os.path.join(dst_dir, final_name)
+        if os.path.abspath(dst_abs) != os.path.abspath(src_abs):
+            seq = 1
+            while os.path.exists(dst_abs):
+                cand = f"{slug}_{seq}{ext}" if ext else f"{slug}_{seq}"
+                dst_abs = os.path.join(dst_dir, cand)
+                final_name = cand
+                seq += 1
+            try:
+                os.rename(src_abs, dst_abs)
+            except Exception as err:
+                yield event.plain_result(f"重命名失败：{err}")
+                return
+
+        # 更新索引：路径保持相对 root_dir
+        rel_new = os.path.relpath(dst_abs, self.root_dir)
+        e["path"] = rel_new
+        e["name"] = final_name
+        try:
+            self._save_registry({"files": files})
+            yield event.plain_result(f"已重命名为：{final_name}\n新路径：{rel_new}")
+        except Exception as err:
+            yield event.plain_result(f"保存索引失败，但文件已重命名：{err}")
 
     # 注：不再通过 on_llm_request 注入工具或绑定 provider，转为在命令入口显式指定 provider，并交由默认 LLM 流程处理。

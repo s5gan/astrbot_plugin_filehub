@@ -34,6 +34,7 @@ AstrBot FileHub 插件
 - `/filehub info` 查看根目录与索引状态（包含实际使用的索引文件路径与条目数）
 - `/filehub list [关键词]` 搜索并列出候选
 - `/filehub send <id>` 发送索引中的文件
+- `/filehub rename <id> <新文件名>` 重命名实体文件（可修改后缀），并同步更新索引。例如：`/filehub rename logo 项目方案_v2.pdf`
 - `/找文件 <关键词>` 交给 LLM 使用工具自动检索与发送
 - `/filehub show <id>` 查看单个条目的详情（路径、大小、权限等）
 - `/filehub index [all|images] [yes|no]` 扫描根目录并将新文件写入索引（默认 all、递归）
@@ -49,8 +50,8 @@ AstrBot FileHub 插件
   - 无结果会友好提示并建议关键词；严格遵循索引权限。
 - “保存最近发送的媒体”（适配 QQ 手机版不能同时发文本和文件）：
   1) 先发送文件或图片；
-  2) 再发送文本说明“把刚才那张图/文件保存一下，名称：XX，标签：A,B，描述：YYY”；
-  - 模型将调用 `save_recent_file(name, description?, send_as?)` 完成入库与索引写入。
+  2) 再发送文本说明“把刚才那张图/文件保存一下，名称：XX（无需后缀），描述：YYY”；
+  - 模型将调用 `save_recent_file(name, description?, send_as?)` 完成入库与索引写入；实体文件名由 LLM 基于描述命名，系统会严格保留原始文件的后缀扩展名。
 
 LLM 工具（给有需要的开发者参考）：
 - `save_recent_file(name: string, description?: string, send_as?: string)`：

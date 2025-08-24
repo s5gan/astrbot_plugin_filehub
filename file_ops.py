@@ -38,6 +38,34 @@ def is_valid_image_file(path: str) -> bool:
         return False
 
 
+def detect_extension_by_magic(path: str) -> str:
+    """通过文件魔数猜测常见后缀。
+
+    覆盖：png/jpg/gif/webp/bmp/pdf（可按需扩展）。
+    返回带点的扩展名，未知返回空字符串。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+        # 图片类
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if head.startswith(b"\xFF\xD8"):
+            return ".jpg"
+        if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+            return ".gif"
+        if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return ".webp"
+        if head.startswith(b"BM"):
+            return ".bmp"
+        # 文档类
+        if head.startswith(b"%PDF"):
+            return ".pdf"
+    except Exception:
+        pass
+    return ""
+
+
 def normalize_abs_path(root_dir: str, p: str) -> str:
     """将相对路径基于 root_dir 解析为绝对路径"""
     if os.path.isabs(p):
