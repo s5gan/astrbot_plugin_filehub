@@ -267,21 +267,7 @@ class FileHubPlugin(Star):
         ]
         yield event.plain_result("\n".join(lines))
 
-    @filehub.command("set_callback")
-    async def set_callback(self, event: AstrMessageEvent, url: str):
-        """设置回调地址供 Napcat 拉取文件，例如: /filehub set_callback http://127.0.0.1:6185"""
-        url = (url or "").strip()
-        if not (url.startswith("http://") or url.startswith("https://")):
-            yield event.plain_result("请提供以 http:// 或 https:// 开头的地址")
-            return
-        try:
-            conf = self.context.get_config()
-            conf["callback_api_base"] = url
-            conf.save_config()
-            self.cb_base = url
-            yield event.plain_result(f"已设置 callback_api_base = {url}，请稍后重试发送文件。")
-        except Exception as e:
-            yield event.plain_result(f"设置失败: {e}")
+    
 
 
 
@@ -420,7 +406,7 @@ class FileHubPlugin(Star):
         """保存最近发送的图片/文件到文件库并写入索引。
 
         参数:
-        - name(string): 条目名称（不要包含扩展名；缺省将从消息文本推断）
+        - name(string): 条目名称（包含扩展名；尽可能按原文件名写）
         - description(string): 描述
         - send_as(string): auto|image|file（默认 auto）
         - which(number): 选取第几个最近媒体，-1 表示最后一个
@@ -935,102 +921,9 @@ class FileHubPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"保存失败：{e}")
 
-    @filehub.command("update")
-    async def update_entry(self, event: AstrMessageEvent, file_id: str, field: str, value: str = GreedyStr):
-        """更新索引条目字段。
+    
 
-        用法：/filehub update <id> <field> <value>
-        - field 可为 name|desc|send_as
-        """
-        reg, _ = load_registry(self.root_dir, self.registry_file)
-        files = reg.get("files", [])
-        e = next((x for x in files if str(x.get("id")) == str(file_id)), None)
-        if not e:
-            yield event.plain_result(f"未找到 id={file_id} 的条目。")
-            return
-        field = (field or "").lower()
-        if field == "name":
-            e["name"] = value.strip()
-        elif field in {"desc", "description"}:
-            e["description"] = value.strip()
-        elif field == "send_as":
-            v = (value or "auto").lower()
-            if v not in {"auto", "image", "file"}:
-                yield event.plain_result("send_as 仅支持 auto|image|file")
-                return
-            e["send_as"] = v
-        else:
-            yield event.plain_result("不支持的字段，请使用 name|desc|send_as")
-            return
-        try:
-            self._save_registry({"files": files})
-            yield event.plain_result("已更新。")
-        except Exception as e:
-            yield event.plain_result(f"保存失败：{e}")
-
-    # =============== 辅助命令：扫描并写入索引 ===============
-
-    # =============== 辅助命令：扫描并写入索引 ===============
-    @filehub.command("index")
-    async def build_index(self, event: AstrMessageEvent, mode: str = "all", recursive: str = "yes"):
-        """扫描 root_dir 并将新文件写入索引
-
-        用法：/filehub index [all|images] [yes|no]
-        - mode = all | images（仅收集图片）
-        - recursive = yes | no（是否递归子目录）
-        说明：仅新增未在索引中的文件，自动生成 id/name/send_as。
-        """
-        reg, used_path = load_registry(self.root_dir, self.registry_file)
-        files = reg.get("files", [])
-        known_abs = {os.path.abspath(normalize_abs_path(self.root_dir, f.get("path", ""))) for f in files}
-        add_cnt = 0
-        index_abs = os.path.abspath(resolve_registry_path(self.root_dir, self.registry_file))
-        for root, dirs, fnames in os.walk(self.root_dir):
-            # 跳过隐藏目录
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            for fn in fnames:
-                if fn.startswith('.'):
-                    continue
-                fp = os.path.join(root, fn)
-                # 跳过索引文件本身
-                if os.path.abspath(fp) == index_abs:
-                    continue
-                if mode == "images" and not is_image(fp):
-                    continue
-                abp = os.path.abspath(fp)
-                if abp in known_abs:
-                    continue
-                relp = os.path.relpath(abp, self.root_dir)
-                # 生成唯一 id
-                base = self._slugify(fn)
-                uid = base
-                i = 1
-                ids = {str(x.get("id")) for x in files}
-                while uid in ids:
-                    i += 1
-                    uid = f"{base}_{i}"
-                entry = {
-                    "id": uid,
-                    "path": relp,
-                    "name": fn,
-                    "description": "",
-                    "send_as": "image" if is_image(fp) else "file",
-                    "permissions": {"allow": {"users": [], "groups": []}, "deny": {"users": [], "groups": []}},
-                }
-                files.append(entry)
-                known_abs.add(abp)
-                add_cnt += 1
-            if recursive.lower() not in {"y", "yes", "true", "1"}:
-                break
-        # 保存
-        try:
-            path = resolve_registry_path(self.root_dir, self.registry_file)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"files": files}, f, ensure_ascii=False, indent=2)
-            yield event.plain_result(f"索引完成，新增 {add_cnt} 条，写入：{path}")
-        except Exception as e:
-            yield event.plain_result(f"写入索引失败：{e}")
+    
 
     @filehub.command("rename")
     async def rename_entry(self, event: AstrMessageEvent, file_id: str, new_name: str = GreedyStr):

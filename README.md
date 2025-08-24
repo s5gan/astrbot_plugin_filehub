@@ -37,11 +37,9 @@ AstrBot FileHub 插件
 - `/filehub rename <id> <新文件名>` 重命名实体文件（可修改后缀），并同步更新索引。例如：`/filehub rename logo 项目方案_v2.pdf`
 - `/找文件 <关键词>` 交给 LLM 使用工具自动检索与发送
 - `/filehub show <id>` 查看单个条目的详情（路径、大小、权限等）
-- `/filehub index [all|images] [yes|no]` 扫描根目录并将新文件写入索引（默认 all、递归）
-- `/filehub probe <id>` 诊断路径映射（用于排查 Napcat 无法读文件问题）
-- `/filehub set_callback <url>` 设置回调地址（Napcat 拉取文件用），如 `http://127.0.0.1:6185`
+ - `/filehub probe <id>` 诊断路径映射（用于排查 Napcat 无法读文件问题）
 - `/filehub remove <id>` 从索引移除条目（不删除物理文件）
-- `/filehub update <id> <field> <value>` 更新条目，field 支持 `name|desc|send_as`
+  元数据修改可通过自然语言驱动，让 LLM 调用 `update_file_metadata` 工具完成（支持 `name|description|send_as`）。
 
 自然语言驱动：
 - 无需指令，直接说“把XX文档发我”“找下关于XX的图片”等：
@@ -78,7 +76,7 @@ LLM 工具（给有需要的开发者参考）：
 - 如果不使用回调、而想走本地路径：必须保证 Napcat 能直接读取该路径（容器需挂载，或本机路径一致），并配置 `platform_settings.path_mapping` 将宿主路径映射为适配器可见路径。
 
 小贴士：
-- 设置回调地址：`/filehub set_callback http://127.0.0.1:6185`
+- 如需回调地址（Napcat 拉取文件），请在 AstrBot 全局配置中设置 `callback_api_base`。
 - 使用 LLM：给出关键词即可，LLM 会先 `search_local_files` 再 `send_local_file_by_id`
 - YAML 索引不再支持，仅支持 `registry.json`
 
